@@ -2,7 +2,11 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ArduinoJson.h>
+#ifdef TABBIE_M5STICKC_PLUS2
+#include "u8g2_compat_m5.h"   // M5StickC PLUS2: U8g2 互換シム(M5GFX 上に実装)
+#else
 #include <U8g2lib.h>
+#endif
 #include <Preferences.h>
 #include <ESPmDNS.h>
 #include <DNSServer.h>
@@ -11,7 +15,11 @@
 // ============================================
 // SERVO CONFIGURATION (SIMPLIFIED)
 // ============================================
+#ifdef TABBIE_M5STICKC_PLUS2
+const int SERVO_PIN = 33;   // PLUS2 の Grove ポート (G32=SDA / G33=SCL)
+#else
 const int SERVO_PIN = 13;
+#endif
 Servo neckServo;
 
 // Servo positions (degrees)
@@ -88,7 +96,11 @@ const unsigned long DEBUG_MODE_DURATION = 8000; // Show debug info for 8 seconds
 
 // Physical button for showing debug info
 // Using GPIO27 - safe pin that's not a strapping pin
+#ifdef TABBIE_M5STICKC_PLUS2
+const int DEBUG_BUTTON_PIN = 37;   // PLUS2 の BtnA
+#else
 const int DEBUG_BUTTON_PIN = 27;
+#endif
 unsigned long lastButtonPress = 0;
 const unsigned long BUTTON_DEBOUNCE_MS = 300; // Debounce time
 
@@ -173,15 +185,24 @@ void setup() {
 }
 
 void setupDisplay() {
-  Wire.begin(21, 22);
-  
+#ifdef TABBIE_M5STICKC_PLUS2
+  auto cfg = M5.config();
+  M5.begin(cfg);              // 電源・ボタン・IMU・画面の初期化
+#else
+  Wire.begin(21, 22);         // 外付け OLED の I2C
+#endif
+
   display.begin();
   display.clearBuffer();
   // Don't show "Starting..." text - just clear the display
   // Startup animation will begin immediately in loop()
   display.sendBuffer();
   
+  #ifdef TABBIE_M5STICKC_PLUS2
+  Serial.println("✅ Display initialized (M5StickC PLUS2 / U8g2 compat shim)");
+#else
   Serial.println("✅ OLED Display initialized (U8g2 SH1106)");
+#endif
 }
 
 void setupServo() {
