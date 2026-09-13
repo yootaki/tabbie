@@ -1,4 +1,9 @@
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import {
+  authHeaders,
+  isPairingError,
+  pairWithDevice,
+} from '../utils/tabbieAuth';
 import { useTodo } from './TodoContext';
 
 const TABBIE_HOSTNAME = "tabbie.local";
@@ -172,9 +177,7 @@ export const TabbieProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       console.log('🎨 Sending animation to Tabbie:', animation, task, duration ? `(${duration}s)` : '');
       const response = await fetch(`http://${customIP}/api/animation`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: authHeaders(),
         body: JSON.stringify(payload),
         signal: AbortSignal.timeout(CONNECTION_TIMEOUT),
       });
@@ -190,6 +193,32 @@ export const TabbieProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         // Update status to reflect the change
         setTimeout(updateStatus, 500);
         return true;
+      } else if (await isPairingError(response)) {
+        // デバイスがこのブラウザをまだ承認していない。
+        // 画面に出るコードを本人に入力してもらい、成功したら1回だけ再送する。
+        console.log('🔑 Device is not paired with this browser - starting pairing');
+        const paired = await pairWithDevice(customIP, async (secondsValid) =>
+          window.prompt(
+            `Tabbie の画面に6桁のコードが出ています。\n${secondsValid}秒以内に入力してください。`,
+          ),
+        );
+        if (!paired) {
+          console.log('❌ Pairing cancelled or failed');
+          return false;
+        }
+        const retry = await fetch(`http://${customIP}/api/animation`, {
+          method: 'POST',
+          headers: authHeaders(),
+          body: JSON.stringify(payload),
+          signal: AbortSignal.timeout(CONNECTION_TIMEOUT),
+        });
+        if (retry.ok) {
+          console.log('✅ Paired and animation sent:', animation);
+          setLastSyncedAnimation(animation);
+          setTimeout(updateStatus, 500);
+          return true;
+        }
+        return false;
       } else {
         console.log('❌ Failed to send animation:', response.statusText);
         return false;
@@ -214,9 +243,7 @@ export const TabbieProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       console.log('🔧 Triggering debug mode on Tabbie...');
       const response = await fetch(`http://${customIP}/api/debug`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: authHeaders(),
         signal: AbortSignal.timeout(CONNECTION_TIMEOUT),
       });
 
