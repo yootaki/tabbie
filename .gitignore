@@ -11,3 +11,6 @@ sounds/
 
 node_modules/
 app/node_modules/
+PROGRESS.md
+RESUME_PROMPT.md
+backup/
