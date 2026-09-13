@@ -54,6 +54,11 @@ bool focusHalfwayDone = false;
 #include "love01.h"
 #include "startup01.h"
 #include "angry_bitmap.h"  // Keep angry as static image
+#include "idle_moods.h"    // アイドル時に表情を切り替える
+#include "device_auth.h"   // LAN からの接続を本人承認制にする
+
+static IdleMoodPicker idleMood;
+static DeviceAuth deviceAuth;
 
 // OLED display configuration - Using U8g2 with SH1106 driver
 U8G2_SH1106_128X64_NONAME_F_HW_I2C display(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
@@ -123,11 +128,14 @@ void handleStatus();
 void handleAnimation();
 void handleWiFiSettings();
 void handleCORS();
+void handlePair();
+void handlePairConfirm();
 void updateDisplay();
 void drawSetupMode();
 void drawConnecting();
 void drawConnected();
 void drawError();
+void drawPairingCode();
 void drawIdleAnimation();
 void drawFocusAnimation();
 void drawRelaxAnimation();
@@ -174,6 +182,8 @@ void setup() {
   
   // Initialize preferences
   preferences.begin("tabbie", false);
+  randomSeed(esp_random());
+  deviceAuth.begin(&preferences);
   
   // Load WiFi credentials (don't connect yet - animations first!)
   loadWiFiCredentials();
@@ -504,7 +514,17 @@ void setupWebServer() {
   server.on("/api/servo", HTTP_OPTIONS, handleCORS);
   server.on("/wifi", HTTP_GET, handleWiFiSettings);
   server.on("/wifi", HTTP_POST, handleWiFiConfig);
-  
+
+  // ペアリング
+  server.on("/api/pair", HTTP_POST, handlePair);
+  server.on("/api/pair", HTTP_OPTIONS, handleCORS);
+  server.on("/api/pair/confirm", HTTP_POST, handlePairConfirm);
+  server.on("/api/pair/confirm", HTTP_OPTIONS, handleCORS);
+
+  // WebServer は明示しないとリクエストヘッダを保持しない
+  const char* collect[] = {DeviceAuth::kHeader};
+  server.collectHeaders(collect, 1);
+
   server.begin();
   webServerStarted = true;
   Serial.println("✅ Web server started");
@@ -534,10 +554,45 @@ void loop() {
   delay(5);
 }
 
+// ペアリング申請。画面に6桁コードを出す。コードを読めるのは
+// 物理的にデバイスの前にいる人だけなので、これが本人承認の代わりになる。
+void handlePair() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  deviceAuth.beginPairing();
+  JsonDocument doc;
+  doc["status"] = "awaiting_approval";
+  doc["message"] = "Enter the 6-digit code shown on the device.";
+  doc["expires_in"] = DeviceAuth::kPairWindowMs / 1000;
+  String out; serializeJson(doc, out);
+  server.send(202, "application/json", out);
+}
+
+// コード照合。合っていればトークンを発行する。
+void handlePairConfirm() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  JsonDocument body;
+  DeserializationError err = deserializeJson(body, server.arg("plain"));
+  String code = err ? String("") : String(body["code"] | "");
+
+  String token = deviceAuth.confirmPairing(code);
+  JsonDocument doc;
+  if (token.isEmpty()) {
+    doc["error"] = "invalid_code";
+    doc["hint"] = "Code is wrong or expired. POST /api/pair again.";
+    String out; serializeJson(doc, out);
+    server.send(403, "application/json", out);
+    return;
+  }
+  doc["token"] = token;
+  doc["header"] = DeviceAuth::kHeader;
+  String out; serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
 void handleCORS() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type, X-Tabbie-Token");
   server.send(200, "text/plain", "");
 }
 
@@ -723,6 +778,7 @@ void handleStatus() {
 }
 
 void handleReset() {
+  if (!deviceAuth.require(server)) return;   // 未承認クライアントは弾く
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.sendHeader("Content-Type", "application/json");
   
@@ -739,6 +795,7 @@ void handleReset() {
 }
 
 void handleDebug() {
+  if (!deviceAuth.require(server)) return;   // 未承認クライアントは弾く
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.sendHeader("Content-Type", "application/json");
   
@@ -765,6 +822,7 @@ void handleDebug() {
 }
 
 void handleAnimation() {
+  if (!deviceAuth.require(server)) return;   // 未承認クライアントは弾く
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.sendHeader("Content-Type", "application/json");
   
@@ -831,6 +889,7 @@ void handleAnimation() {
 }
 
 void handleServoTest() {
+  if (!deviceAuth.require(server)) return;   // 未承認クライアントは弾く
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.sendHeader("Content-Type", "application/json");
   
@@ -889,6 +948,12 @@ void updateDisplay() {
   // In setup mode, show setup screen
   if (isInSetupMode) {
     drawSetupMode();
+    return;
+  }
+
+  // ペアリング申請中はコードを最優先で表示する
+  if (deviceAuth.pairingActive()) {
+    drawPairingCode();
     return;
   }
   
@@ -1115,6 +1180,27 @@ void drawError() {
   display.sendBuffer();
 }
 
+// ペアリング申請中に6桁コードを画面へ。
+// これを読めるのは物理的にデバイスの前にいる人だけ。
+void drawPairingCode() {
+  display.clearBuffer();
+
+  display.setFont(u8g2_font_6x10_tf);
+  const char* title = "ALLOW THIS DEVICE?";
+  display.drawStr((128 - (int)strlen(title) * 6) / 2, 12, title);
+
+  display.setFont(u8g2_font_10x20_tf);
+  String code = deviceAuth.pendingCode();
+  display.drawStr((128 - (int)code.length() * 12) / 2, 40, code.c_str());
+
+  display.setFont(u8g2_font_6x10_tf);
+  char foot[24];
+  snprintf(foot, sizeof(foot), "expires in %ds", deviceAuth.pendingSecondsLeft());
+  display.drawStr((128 - (int)strlen(foot) * 6) / 2, 58, foot);
+
+  display.sendBuffer();
+}
+
 void drawIdleAnimation() {
   static int frame = 0;
   static unsigned long lastFrameTime = 0;
@@ -1126,6 +1212,7 @@ void drawIdleAnimation() {
     frame = 0;
     lastFrameTime = 0;
     lastStart = animationStartTime;
+    idleMood.reset();
     
     // If triggered via API, activate servo immediately!
     if (animationTriggeredViaAPI) {
@@ -1136,30 +1223,35 @@ void drawIdleAnimation() {
     }
   }
   
+  const IdleMood& mood = idleMood.current();
+
   unsigned long now = millis();
-  if (now - lastFrameTime < IDLE01_FRAME_DELAY) return;
+  if (now - lastFrameTime < (unsigned long)mood.frameDelayMs) return;
   lastFrameTime = now;
   
   // Draw animation frame
   display.clearBuffer();
-  const uint8_t* frameData = (const uint8_t*)pgm_read_ptr(&idle01_frames[frame]);
+  const uint8_t* frameData = (const uint8_t*)pgm_read_ptr(&mood.frames[frame]);
   display.drawBitmap(0, 0, 128 / 8, 64, frameData);
   display.sendBuffer();
   
   // Servo keyframes (when active)
   // Idle keyframes: frame 25=left, 50=center, 75=right, 90=center
   if (servoActive) {
-    if (frame == 25) moveServoTo(SERVO_LEFT);
-    else if (frame == 50) moveServoTo(SERVO_CENTER);
-    else if (frame == 75) moveServoTo(SERVO_RIGHT);
-    else if (frame == 90) moveServoTo(SERVO_CENTER);
+    // 元は97フレーム固定の決め打ちだった。ムードごとに長さが違うので割合で出す
+    const int n = mood.frameCount;
+    if (frame == n / 4) moveServoTo(SERVO_LEFT);
+    else if (frame == n / 2) moveServoTo(SERVO_CENTER);
+    else if (frame == (n * 3) / 4) moveServoTo(SERVO_RIGHT);
+    else if (frame == (n * 9) / 10) moveServoTo(SERVO_CENTER);
   }
   
   // Next frame
   frame++;
-  if (frame >= IDLE01_FRAME_COUNT) {
+  if (frame >= mood.frameCount) {
     frame = 0;
     idleLoopCount++;
+    idleMood.advance();   // 1ループごとに次の表情を抽選
     
     // After first loop, clear API flag
     if (animationTriggeredViaAPI) {
