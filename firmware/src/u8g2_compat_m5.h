@@ -97,7 +97,9 @@ class U8G2Compat {
 
   void drawPixel(int x, int y) { canvas_.drawPixel(x, y, 1); }
   void drawFrame(int x, int y, int w, int h) { canvas_.drawRect(x, y, w, h, 1); }
-  void drawBox(int x, int y, int w, int h) { canvas_.fillRect(x, y, w, h, 1); }
+  void drawBox(int x, int y, int w, int h) { canvas_.fillRect(x, y, w, h, drawColor_); }
+  // U8g2 の setDrawColor(0/1)。drawBox の塗り色にだけ効かせる（黒塗りで下地を消す用途）
+  void setDrawColor(uint8_t c) { drawColor_ = c ? 1 : 0; }
   void drawDisc(int x, int y, int r) { canvas_.fillCircle(x, y, r, 1); }
 
  private:
@@ -105,6 +107,7 @@ class U8G2Compat {
 
   M5Canvas canvas_;
   int textSize_ = 1;
+  uint8_t drawColor_ = 1;
   int glyphH_ = 8;
 };
 

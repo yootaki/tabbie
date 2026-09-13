@@ -138,6 +138,7 @@ void drawError();
 void drawPairingCode();
 void drawIdleAnimation();
 void drawFocusAnimation();
+void drawFocusGauge(float progress, unsigned long elapsed);
 void drawRelaxAnimation();
 void drawLoveAnimation();
 void drawStartupAnimation();
@@ -1369,9 +1370,33 @@ void drawFocusAnimation() {
     
     const uint8_t* frameData = (const uint8_t*)pgm_read_ptr(&focus01_frames[frame]);
     display.drawBitmap(0, 0, 128 / 8, 64, frameData);
+    if (focusDuration > 0) drawFocusGauge(progress, elapsed);
   }
   
   display.sendBuffer();
+}
+
+// 集中中は顔の下端に進捗バーと残り時間を常時出す（節目の3秒オーバーレイとは別）。
+// 顔ビットマップは 128x64 いっぱいなので、下 10px を黒で塗り潰してから描く。
+void drawFocusGauge(float progress, unsigned long elapsed) {
+  const int gaugeY = 54;
+  const int gaugeH = 10;
+  const int barX = 2, barY = gaugeY + 1, barW = 88, barH = 8;
+  const int timeX = 96;
+
+  display.setDrawColor(0);
+  display.drawBox(0, gaugeY, 128, gaugeH);
+  display.setDrawColor(1);
+
+  display.drawFrame(barX, barY, barW, barH);
+  int fill = (int)(progress * (barW - 4));
+  if (fill > 0) display.drawBox(barX + 2, barY + 2, fill, barH - 4);
+
+  unsigned long remaining = focusDuration > elapsed ? focusDuration - elapsed : 0;
+  char timeStr[8];
+  sprintf(timeStr, "%lu:%02lu", remaining / 60000, (remaining % 60000) / 1000);
+  display.setFont(u8g2_font_6x10_tf);
+  display.drawStr(timeX, gaugeY + gaugeH - 1, timeStr);
 }
 
 void drawRelaxAnimation() {
