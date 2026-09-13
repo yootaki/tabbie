@@ -4,6 +4,7 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { useTabbieSync } from '@/contexts/TabbieContext';
+import { authHeaders } from '@/utils/tabbieAuth';
 
 // Servo position constants (matching firmware)
 const SERVO_LEFT = 15;
@@ -110,7 +111,9 @@ const TabbiePage: React.FC<TabbiePageProps> = ({ theme = 'clean' }) => {
     setCustomIP: setCustomIPContext,
     activityState,
     disconnect,
-    sendAnimation
+    sendAnimation,
+    pairBrowser,
+    pairing
   } = useTabbieSync();
 
   const [localIP, setLocalIP] = React.useState(customIP);
@@ -131,7 +134,7 @@ const TabbiePage: React.FC<TabbiePageProps> = ({ theme = 'clean' }) => {
     
     setIsResetting(true);
     try {
-      await fetch(`http://${customIP}/api/reset`, { method: 'POST' });
+      await fetch(`http://${customIP}/api/reset`, { method: 'POST', headers: authHeaders() });
       disconnect();
     } catch (e) {
       console.log('Reset sent, Tabbie is restarting...');
@@ -235,7 +238,7 @@ const TabbiePage: React.FC<TabbiePageProps> = ({ theme = 'clean' }) => {
     try {
       await fetch(`http://${customIP}/api/servo`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders(),
         body: JSON.stringify({ position })
       });
       // Update local display
@@ -394,8 +397,17 @@ const TabbiePage: React.FC<TabbiePageProps> = ({ theme = 'clean' }) => {
                 </div>
               )}
 
-              {/* Reset WiFi */}
-              <div className="mt-4 pt-4 border-t">
+              {/* Pair this browser / Reset WiFi */}
+              <div className="mt-4 pt-4 border-t flex items-center justify-between gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={pairBrowser}
+                  disabled={pairing.status !== 'idle'}
+                  className={theme === 'retro' ? 'border-2 border-black rounded-xl' : ''}
+                >
+                  {pairing.status !== 'idle' ? 'Pairing...' : 'Pair this browser'}
+                </Button>
                 <Button
                   variant="ghost"
                   size="sm"

@@ -1,10 +1,13 @@
-import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
 import {
   authHeaders,
   isPairingError,
   pairWithDevice,
+  type CodeAnswer,
+  type CodePrompt,
 } from '../utils/tabbieAuth';
 import { useTodo } from './TodoContext';
+import { PairingDialog } from '../components/PairingDialog';
 
 const TABBIE_HOSTNAME = "tabbie.local";
 const RECONNECT_INTERVAL = 5000; // Try to reconnect every 5 seconds when disconnected
@@ -22,6 +25,18 @@ interface TabbieStatus {
 
 type TabbieActivityState = 'idle' | 'pomodoro' | 'break' | 'complete' | 'focus' | 'paused';
 
+// ペアリングダイアログの状態。
+// awaiting=コード入力待ち / confirming=照合中 / error=コード不一致で再入力待ち
+export type PairingStatus = 'idle' | 'awaiting' | 'confirming' | 'error';
+export interface PairingState {
+  status: PairingStatus;
+  secondsValid: number;
+  error: string | null;
+  /** 申請ごとに増える。ダイアログの入力・カウントダウンをリセットするためのキー */
+  attempt: number;
+}
+const PAIRING_IDLE: PairingState = { status: 'idle', secondsValid: 0, error: null, attempt: 0 };
+
 interface TabbieContextType {
   isConnected: boolean;
   isConnecting: boolean;
@@ -29,6 +44,7 @@ interface TabbieContextType {
   connectionError: string;
   customIP: string;
   activityState: TabbieActivityState;
+  pairing: PairingState;
 
   // Methods
   checkConnection: () => Promise<void>;
@@ -36,6 +52,8 @@ interface TabbieContextType {
   sendAnimation: (animation: string, task?: string, duration?: number) => Promise<boolean>;
   triggerTaskCompletion: (taskTitle: string) => void;
   triggerDebug: () => Promise<void>;
+  /** 403 を待たずにこのブラウザを能動的にペアリングする */
+  pairBrowser: () => Promise<boolean>;
   disconnect: () => void;
 }
 
@@ -64,6 +82,12 @@ export const TabbieProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   const [activityState, setActivityState] = useState<TabbieActivityState>('idle');
   const [isPlayingCompletionAnimation, setIsPlayingCompletionAnimation] = useState(false);
   const [lastSyncedAnimation, setLastSyncedAnimation] = useState<string | null>(null);
+  const [pairing, setPairing] = useState<PairingState>(PAIRING_IDLE);
+  // ダイアログの submit/cancel/retry で resolve する Promise の resolver
+  const pairingResolver = useRef<((answer: CodeAnswer) => void) | null>(null);
+  // pairWithDevice の多重起動防止（同期ループが 403 を連発しても1本にまとめる）
+  const pairingInFlight = useRef(false);
+  const theme = (userData.settings?.theme as 'clean' | 'retro' | undefined) ?? 'clean';
 
   // Save IP to localStorage when it changes
   useEffect(() => {
@@ -160,6 +184,69 @@ export const TabbieProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     }
   }, [isConnected, customIP]);
 
+  // ---- ペアリング（ダイアログ経由でコードを受け取る） ----
+
+  const askForCode: CodePrompt = useCallback((secondsValid, error) =>
+    new Promise<CodeAnswer>((resolve) => {
+      pairingResolver.current = resolve;
+      setPairing((prev) => ({
+        status: error ? 'error' : 'awaiting',
+        secondsValid,
+        error,
+        // 再申請（error が null で戻ってきた）ならダイアログをリセットする
+        attempt: error ? prev.attempt : prev.attempt + 1,
+      }));
+    }), []);
+
+  const answerPairing = useCallback((answer: CodeAnswer) => {
+    const resolve = pairingResolver.current;
+    pairingResolver.current = null;
+    if (!resolve) return;
+    if (answer.kind === 'code') {
+      setPairing((prev) => ({ ...prev, status: 'confirming', error: null }));
+    }
+    resolve(answer);
+  }, []);
+
+  const cancelPairing = useCallback(() => {
+    answerPairing({ kind: 'cancel' });
+    setPairing(PAIRING_IDLE);
+  }, [answerPairing]);
+
+  const runPairing = useCallback(async (): Promise<boolean> => {
+    if (pairingInFlight.current) return false;
+    pairingInFlight.current = true;
+    try {
+      const result = await pairWithDevice(customIP, askForCode);
+      if (!result.ok) console.log('❌ Pairing failed:', result.reason);
+      else console.log('🔑 Paired with Tabbie');
+      return result.ok;
+    } finally {
+      pairingInFlight.current = false;
+      pairingResolver.current = null;
+      setPairing(PAIRING_IDLE);
+    }
+  }, [customIP, askForCode]);
+
+  const pairBrowser = useCallback(() => runPairing(), [runPairing]);
+
+  /**
+   * 書き込み系リクエストの共通ヘルパ。403(unpaired) ならペアリングを挟んで1回だけ再送する。
+   * ペアリングが中断・失敗したときは null を返す。
+   */
+  const withPairing = useCallback(async (request: () => Promise<Response>): Promise<Response | null> => {
+    const response = await request();
+    if (!(await isPairingError(response))) return response;
+    console.log('🔑 Device is not paired with this browser - starting pairing');
+    if (!(await runPairing())) return null;
+    return request();
+  }, [runPairing]);
+
+  // IP 変更時は進行中のペアリングを捨てる（別デバイス宛のコードは意味がない）
+  useEffect(() => {
+    cancelPairing();
+  }, [customIP, cancelPairing]);
+
   const sendAnimation = useCallback(async (animation: string, task?: string, duration?: number): Promise<boolean> => {
     // Attempt to send even if we think we're disconnected - this acts as a connection check too
 
@@ -175,13 +262,17 @@ export const TabbieProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       }
       
       console.log('🎨 Sending animation to Tabbie:', animation, task, duration ? `(${duration}s)` : '');
-      const response = await fetch(`http://${customIP}/api/animation`, {
+      const response = await withPairing(() => fetch(`http://${customIP}/api/animation`, {
         method: 'POST',
         headers: authHeaders(),
         body: JSON.stringify(payload),
         signal: AbortSignal.timeout(CONNECTION_TIMEOUT),
-      });
+      }));
 
+      if (!response) {
+        console.log('❌ Pairing cancelled or failed');
+        return false;
+      }
       if (response.ok) {
         console.log('✅ Animation sent successfully:', animation);
         setLastSyncedAnimation(animation);
@@ -193,32 +284,6 @@ export const TabbieProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         // Update status to reflect the change
         setTimeout(updateStatus, 500);
         return true;
-      } else if (await isPairingError(response)) {
-        // デバイスがこのブラウザをまだ承認していない。
-        // 画面に出るコードを本人に入力してもらい、成功したら1回だけ再送する。
-        console.log('🔑 Device is not paired with this browser - starting pairing');
-        const paired = await pairWithDevice(customIP, async (secondsValid) =>
-          window.prompt(
-            `Tabbie の画面に6桁のコードが出ています。\n${secondsValid}秒以内に入力してください。`,
-          ),
-        );
-        if (!paired) {
-          console.log('❌ Pairing cancelled or failed');
-          return false;
-        }
-        const retry = await fetch(`http://${customIP}/api/animation`, {
-          method: 'POST',
-          headers: authHeaders(),
-          body: JSON.stringify(payload),
-          signal: AbortSignal.timeout(CONNECTION_TIMEOUT),
-        });
-        if (retry.ok) {
-          console.log('✅ Paired and animation sent:', animation);
-          setLastSyncedAnimation(animation);
-          setTimeout(updateStatus, 500);
-          return true;
-        }
-        return false;
       } else {
         console.log('❌ Failed to send animation:', response.statusText);
         return false;
@@ -231,7 +296,7 @@ export const TabbieProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       }
       return false;
     }
-  }, [isConnected, customIP, updateStatus]);
+  }, [isConnected, customIP, updateStatus, withPairing]);
 
   const triggerDebug = useCallback(async () => {
     if (!isConnected) {
@@ -241,13 +306,15 @@ export const TabbieProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
     try {
       console.log('🔧 Triggering debug mode on Tabbie...');
-      const response = await fetch(`http://${customIP}/api/debug`, {
+      const response = await withPairing(() => fetch(`http://${customIP}/api/debug`, {
         method: 'POST',
         headers: authHeaders(),
         signal: AbortSignal.timeout(CONNECTION_TIMEOUT),
-      });
+      }));
 
-      if (response.ok) {
+      if (!response) {
+        console.log('❌ Pairing cancelled or failed');
+      } else if (response.ok) {
         const data = await response.json();
         console.log('✅ Debug mode activated:', data);
       } else {
@@ -256,7 +323,7 @@ export const TabbieProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     } catch (error) {
       console.error('❌ Failed to trigger debug mode:', error);
     }
-  }, [isConnected, customIP]);
+  }, [isConnected, customIP, withPairing]);
 
   const triggerTaskCompletion = useCallback((taskTitle: string) => {
     if (!isConnected) {
@@ -282,7 +349,8 @@ export const TabbieProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     setIsConnected(false);
     setTabbieStatus(null);
     setConnectionError('');
-  }, []);
+    cancelPairing();
+  }, [cancelPairing]);
 
   // Auto-connect on component mount (with delay so user can enter IP first)
   useEffect(() => {
@@ -414,14 +482,31 @@ export const TabbieProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     connectionError,
     customIP,
     activityState,
+    pairing,
     checkConnection,
     setCustomIP,
     sendAnimation,
     triggerTaskCompletion,
     triggerDebug,
+    pairBrowser,
     disconnect,
   };
 
-  return <TabbieContext.Provider value={value}>{children}</TabbieContext.Provider>;
+  return (
+    <TabbieContext.Provider value={value}>
+      {children}
+      <PairingDialog
+        key={pairing.attempt}
+        open={pairing.status !== 'idle'}
+        secondsValid={pairing.secondsValid}
+        error={pairing.error}
+        busy={pairing.status === 'confirming'}
+        theme={theme}
+        onSubmit={(code) => answerPairing({ kind: 'code', code })}
+        onCancel={cancelPairing}
+        onRetry={() => answerPairing({ kind: 'retry' })}
+      />
+    </TabbieContext.Provider>
+  );
 };
 
