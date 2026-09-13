@@ -5,7 +5,8 @@
 // 1ループ終わるたびに次のムードを抽選する。新しい絵を足していないので
 // フラッシュは1バイトも増えない。
 //
-// 重み付けは idle を主役に。relax と love はたまに出る「ふとした表情」。
+// 重み付けは idle を主役に。relax / love / sleepy / look / blink はたまに出る「ふとした表情」。
+// sleepy / look / blink は idle01 を tools/gen_idle_variants.py で加工した生成物。
 // 同じムードが3連続したら必ず別のものへ移す（ずっと同じ顔にならないように）。
 
 #pragma once
@@ -15,6 +16,7 @@
 #include "idle01.h"
 #include "love01.h"
 #include "relax01.h"
+#include "idle_variants.h"  // idle01 を加工した sleepy / look / blink
 
 struct IdleMood {
   const unsigned char* const* frames;
@@ -25,9 +27,12 @@ struct IdleMood {
 };
 
 static const IdleMood kIdleMoods[] = {
-    {idle01_frames,  IDLE01_FRAME_COUNT,  IDLE01_FRAME_DELAY,  70, "idle"},
-    {relax01_frames, RELAX01_FRAME_COUNT, RELAX01_FRAME_DELAY, 20, "relax"},
-    {love01_frames,  LOVE01_FRAME_COUNT,  LOVE01_FRAME_DELAY,  10, "love"},
+    {idle01_frames,   IDLE01_FRAME_COUNT,   IDLE01_FRAME_DELAY,   50, "idle"},
+    {relax01_frames,  RELAX01_FRAME_COUNT,  RELAX01_FRAME_DELAY,  15, "relax"},
+    {love01_frames,   LOVE01_FRAME_COUNT,   LOVE01_FRAME_DELAY,    5, "love"},
+    {sleepy01_frames, SLEEPY01_FRAME_COUNT, SLEEPY01_FRAME_DELAY, 10, "sleepy"},
+    {look01_frames,   LOOK01_FRAME_COUNT,   LOOK01_FRAME_DELAY,   10, "look"},
+    {blink01_frames,  BLINK01_FRAME_COUNT,  BLINK01_FRAME_DELAY,  10, "blink"},
 };
 static const int kIdleMoodCount = sizeof(kIdleMoods) / sizeof(kIdleMoods[0]);
 
