@@ -108,6 +108,18 @@ const int DEBUG_BUTTON_PIN = 27;
 #endif
 unsigned long lastButtonPress = 0;
 const unsigned long BUTTON_DEBOUNCE_MS = 300; // Debounce time
+const unsigned long BUTTON_LONG_PRESS_MS = 1500; // 長押し＝デバッグ情報
+unsigned long buttonPressedAt = 0;   // 押下開始（0=離している）
+
+// 使用量ページ（BtnA 短押しで表情と切替。/api/usage で Mac 側から値を受ける）
+struct UsageWindow { int pct; long resetSec; bool valid; };
+struct UsageWindow usageClaude5h = {0, 0, false};
+struct UsageWindow usageClaude7d = {0, 0, false};
+struct UsageWindow usageCodex7d  = {0, 0, false};
+unsigned long usageReceivedAt = 0;   // 0=未受信
+bool isUsagePage = false;
+unsigned long usagePageStartTime = 0;
+const unsigned long USAGE_PAGE_DURATION = 15000; // 無操作で表情へ戻るまで
 
 // Setup mode configuration
 const char* SETUP_SSID = "Tabbie-Setup";
@@ -146,6 +158,8 @@ void drawAngryImage();
 void drawPomodoroAnimation();
 void drawTaskCompleteAnimation();
 void drawDebugInfo();
+void drawUsagePage();
+void handleUsage();
 void handleDebug();
 void handleReset();
 void handleServoTest();
@@ -507,6 +521,8 @@ void setupWebServer() {
   server.on("/api/status", HTTP_OPTIONS, handleCORS);
   server.on("/api/animation", HTTP_POST, handleAnimation);
   server.on("/api/animation", HTTP_OPTIONS, handleCORS);
+  server.on("/api/usage", HTTP_POST, handleUsage);
+  server.on("/api/usage", HTTP_OPTIONS, handleCORS);
   server.on("/api/debug", HTTP_POST, handleDebug);
   server.on("/api/debug", HTTP_OPTIONS, handleCORS);
   server.on("/api/reset", HTTP_POST, handleReset);
@@ -969,6 +985,16 @@ void updateDisplay() {
       Serial.println("🔧 Debug mode ended - returning to normal display");
     }
   }
+
+  // 使用量ページ（BtnA 短押し）。一定時間で表情に戻る
+  if (isUsagePage) {
+    if (millis() - usagePageStartTime < USAGE_PAGE_DURATION) {
+      drawUsagePage();
+      return;
+    }
+    isUsagePage = false;
+    Serial.println("📟 Usage page closed - returning to normal display");
+  }
   
   // Otherwise, always show animations - WiFi connection happens in background
   if (currentAnimation == "idle") {
@@ -998,18 +1024,101 @@ void checkDebugButton() {
   // Don't allow re-triggering while debug mode is active
   if (isDebugMode) return;
   
-  // Check if button is pressed (LOW because of INPUT_PULLUP)
-  if (digitalRead(DEBUG_BUTTON_PIN) == LOW) {
-    // Debounce check
-    if (millis() - lastButtonPress > BUTTON_DEBOUNCE_MS) {
-      lastButtonPress = millis();
-      
-      // Activate debug mode
+  // 押している間は開始時刻だけ記録し、離した時に長さで振り分ける
+  // 短押し: 使用量ページと表情のトグル / 長押し(1.5s): デバッグ情報
+  bool pressed = (digitalRead(DEBUG_BUTTON_PIN) == LOW);
+  unsigned long now = millis();
+  if (pressed) {
+    if (buttonPressedAt == 0) buttonPressedAt = now;
+    if (now - buttonPressedAt >= BUTTON_LONG_PRESS_MS) {
+      buttonPressedAt = 0;
+      lastButtonPress = now;
+      isUsagePage = false;
       isDebugMode = true;
-      debugModeStartTime = millis();
-      Serial.println("🔘 Debug button pressed - showing device info");
+      debugModeStartTime = now;
+      Serial.println("🔘 Long press - showing device info");
     }
+    return;
   }
+  if (buttonPressedAt == 0) return;
+  unsigned long held = now - buttonPressedAt;
+  buttonPressedAt = 0;
+  if (held < 30 || now - lastButtonPress < BUTTON_DEBOUNCE_MS) return;  // チャタリング
+  lastButtonPress = now;
+  isUsagePage = !isUsagePage;
+  usagePageStartTime = now;
+  Serial.println(isUsagePage ? "🔘 Short press - usage page" : "🔘 Short press - back to face");
+}
+
+// POST /api/usage  {"claude":{"h5":{"pct":17,"reset_s":3600},"d7":{...}},"codex":{"d7":{...}}}
+// 値だけを受ける。トークン等の資格情報はデバイスに来ない（Mac 側の tabbie-bridge が取得）
+void handleUsage() {
+  if (!deviceAuth.require(server)) return;   // 未承認クライアントは弾く
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  if (!server.hasArg("plain")) { server.send(400, "application/json", "{\"error\":\"No data\"}"); return; }
+  JsonDocument doc;
+  if (deserializeJson(doc, server.arg("plain"))) {
+    server.send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+    return;
+  }
+  auto readWin = [](JsonVariant v, UsageWindow& w) {
+    if (v.isNull()) { w.valid = false; return; }
+    w.pct = constrain((int)(v["pct"] | 0), 0, 100);
+    w.resetSec = v["reset_s"] | 0L;
+    w.valid = true;
+  };
+  readWin(doc["claude"]["h5"], usageClaude5h);
+  readWin(doc["claude"]["d7"], usageClaude7d);
+  readWin(doc["codex"]["d7"],  usageCodex7d);
+  usageReceivedAt = millis();
+  Serial.printf("📟 Usage: claude5h=%d%% claude7d=%d%% codex7d=%d%%\n",
+                usageClaude5h.pct, usageClaude7d.pct, usageCodex7d.pct);
+  server.send(200, "application/json", "{\"success\":true}");
+}
+
+static void formatDuration(char* out, size_t n, long sec) {
+  if (sec < 0) sec = 0;
+  long m = sec / 60, h = m / 60, d = h / 24;
+  if (d >= 1) snprintf(out, n, "%ldd%ldh", d, h % 24);
+  else if (h >= 1) snprintf(out, n, "%ldh%02ldm", h, m % 60);
+  else snprintf(out, n, "%ldm", m);
+}
+
+// 1行18px: 上段 ラベル + 右端 %、下段 バー(76px) + 右にリセットまでの残り
+static void drawUsageRow(int top, const char* label, const UsageWindow& w, unsigned long ageMs) {
+  display.drawStr(0, top + 8, label);
+  if (!w.valid) { display.drawStr(92, top + 8, "  --"); return; }
+  char buf[12];
+  snprintf(buf, sizeof(buf), "%3d%%", w.pct);
+  display.drawStr(104, top + 8, buf);
+  display.drawFrame(0, top + 10, 76, 7);
+  int fill = (int)((76 - 4) * w.pct / 100);
+  if (fill > 0) display.drawBox(2, top + 12, fill, 3);
+  long remain = w.resetSec - (long)(ageMs / 1000);
+  formatDuration(buf, sizeof(buf), remain);
+  display.drawStr(80, top + 17, buf);
+}
+
+void drawUsagePage() {
+  display.clearBuffer();
+  display.setFont(u8g2_font_6x10_tf);
+  display.drawStr(0, 8, "AI USAGE");
+  if (usageReceivedAt == 0) {
+    display.drawStr(0, 32, "no data yet");
+    display.drawStr(0, 44, "(bridge sends it)");
+    display.sendBuffer();
+    return;
+  }
+  unsigned long age = millis() - usageReceivedAt;
+  char buf[12];
+  formatDuration(buf, sizeof(buf), (long)(age / 1000));
+  int w = strlen(buf) * 6 + 6 * 4;
+  display.drawStr(128 - w, 8, buf);
+  display.drawStr(128 - 6 * 3, 8, "ago");
+  drawUsageRow(10, "Claude 5h", usageClaude5h, age);
+  drawUsageRow(28, "Claude 7d", usageClaude7d, age);
+  drawUsageRow(46, "Codex  7d", usageCodex7d, age);
+  display.sendBuffer();
 }
 
 void drawDebugInfo() {
