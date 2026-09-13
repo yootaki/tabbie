@@ -55,38 +55,83 @@ export async function isPairingError(response: Response): Promise<boolean> {
   }
 }
 
-export type CodePrompt = (secondsValid: number) => Promise<string | null>;
+/** ダイアログ側からの返答。code=入力された6桁 / retry=期限切れで再申請 / cancel=中断 */
+export type CodeAnswer =
+  | { kind: 'code'; code: string }
+  | { kind: 'retry' }
+  | { kind: 'cancel' };
 
 /**
- * ペアリングを実行する。askForCode にはデバイス画面のコードを人に尋ねる処理を渡す。
- * 成功したらトークンを保存して true を返す。
+ * コードを人に尋ねる処理。error は前回の失敗理由（初回は null）。
+ * 入力UI（PairingDialog）を開き、submit/cancel/retry で resolve する。
  */
-export async function pairWithDevice(
-  address: string,
-  askForCode: CodePrompt,
-): Promise<boolean> {
+export type CodePrompt = (secondsValid: number, error: string | null) => Promise<CodeAnswer>;
+
+export type PairFailure = 'start_failed' | 'cancelled' | 'invalid_code' | 'network';
+export type PairResult = { ok: true } | { ok: false; reason: PairFailure };
+
+const PAIR_TIMEOUT_MS = 5000;
+const DEFAULT_WINDOW_SEC = 120;
+const INVALID_CODE_MESSAGE = 'コードが違います。画面のコードをもう一度確認してください。';
+
+/** POST /api/pair。デバイス画面にコードを出し、有効秒数を返す。 */
+async function startPairing(address: string): Promise<number | null> {
   const start = await fetch(`http://${address}/api/pair`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    signal: AbortSignal.timeout(5000),
+    signal: AbortSignal.timeout(PAIR_TIMEOUT_MS),
   });
-  if (!start.ok && start.status !== 202) return false;
-
+  if (!start.ok && start.status !== 202) return null;
   const info = await start.json().catch(() => ({}));
-  const code = await askForCode(Number(info?.expires_in ?? 120));
-  if (!code) return false;
+  return Number(info?.expires_in ?? DEFAULT_WINDOW_SEC);
+}
 
+/** POST /api/pair/confirm。合っていればトークン文字列、違えば null。 */
+async function confirmPairing(address: string, code: string): Promise<string | null> {
   const confirm = await fetch(`http://${address}/api/pair/confirm`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ code: code.trim() }),
-    signal: AbortSignal.timeout(5000),
+    signal: AbortSignal.timeout(PAIR_TIMEOUT_MS),
   });
-  if (!confirm.ok) return false;
-
+  if (!confirm.ok) return null;
   const data = await confirm.json().catch(() => ({}));
-  if (!data?.token) return false;
+  return typeof data?.token === 'string' && data.token ? data.token : null;
+}
 
-  setDeviceToken(data.token);
-  return true;
+/**
+ * ペアリングを実行する。askForCode にはデバイス画面のコードを人に尋ねる処理を渡す。
+ * - コードが違えば同じ申請のまま再入力を求める（error 付きで askForCode を再呼び出し）
+ * - 期限切れ（retry）のときだけ /api/pair を申請し直す
+ * 成功したらトークンを保存して {ok:true} を返す。
+ */
+export async function pairWithDevice(
+  address: string,
+  askForCode: CodePrompt,
+): Promise<PairResult> {
+  try {
+    let secondsValid = await startPairing(address);
+    if (secondsValid === null) return { ok: false, reason: 'start_failed' };
+
+    let error: string | null = null;
+    for (;;) {
+      const answer = await askForCode(secondsValid, error);
+      if (answer.kind === 'cancel') return { ok: false, reason: 'cancelled' };
+      if (answer.kind === 'retry') {
+        secondsValid = await startPairing(address);
+        if (secondsValid === null) return { ok: false, reason: 'start_failed' };
+        error = null;
+        continue;
+      }
+
+      const token = await confirmPairing(address, answer.code);
+      if (token) {
+        setDeviceToken(token);
+        return { ok: true };
+      }
+      error = INVALID_CODE_MESSAGE;
+    }
+  } catch {
+    return { ok: false, reason: 'network' };
+  }
 }
