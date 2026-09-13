@@ -1566,7 +1566,9 @@ void drawPomodoroAnimation() {
 }
 
 void drawTaskCompleteAnimation() {
+  // 完走はハート顔（love01）を 1 周。下端にタスク名を出す
   static int frame = 0;
+  static unsigned long lastFrameTime = 0;
   static int servoStep = 0;
   static unsigned long lastServoTime = 0;
   static unsigned long lastStart = 0;
@@ -1574,31 +1576,41 @@ void drawTaskCompleteAnimation() {
   // Reset on start
   if (animationStartTime != lastStart) {
     frame = 0;
+    lastFrameTime = 0;
     servoStep = 0;
     lastServoTime = 0;
     lastStart = animationStartTime;
   }
   
-  frame++;
+  unsigned long now = millis();
+  if (now - lastFrameTime >= LOVE01_FRAME_DELAY) {
+    lastFrameTime = now;
+    frame++;
+  }
+  if (frame >= LOVE01_FRAME_COUNT) {
+    currentAnimation = "idle";
+    currentTask = "";
+    moveServoTo(SERVO_CENTER);
+    return;
+  }
   
   display.clearBuffer();
-  display.setFont(u8g2_font_10x20_tf);
-  display.drawStr(45, 20, "(^.^)");
-  display.setFont(u8g2_font_6x10_tf);
-  display.drawStr(20, 35, "Great job!");
+  const uint8_t* frameData = (const uint8_t*)pgm_read_ptr(&love01_frames[frame]);
+  display.drawBitmap(0, 0, 128 / 8, 64, frameData);
   
   String taskDisplay = currentTask;
   if (taskDisplay.length() > 21) taskDisplay = taskDisplay.substring(0, 18) + "...";
-  display.drawStr(0, 50, taskDisplay.c_str());
-  
-  if (frame % 20 < 10) {
-    display.drawPixel(20, 15);
-    display.drawPixel(100, 20);
+  if (taskDisplay.length() > 0) {
+    display.setDrawColor(0);
+    display.drawBox(0, 54, 128, 10);
+    display.setDrawColor(1);
+    display.setFont(u8g2_font_6x10_tf);
+    int w = taskDisplay.length() * 6;
+    display.drawStr((128 - w) / 2, 63, taskDisplay.c_str());
   }
   display.sendBuffer();
   
   // Simple wiggle: left-right-left-right-center
-  unsigned long now = millis();
   if (now - lastServoTime >= 200 && servoStep < 5) {
     lastServoTime = now;
     switch (servoStep) {
@@ -1609,12 +1621,5 @@ void drawTaskCompleteAnimation() {
       case 4: moveServoTo(SERVO_CENTER); break;
     }
     servoStep++;
-  }
-  
-  // Return to idle after 5 seconds
-  if (millis() - animationStartTime > 5000) {
-    currentAnimation = "idle";
-    currentTask = "";
-    moveServoTo(SERVO_CENTER);
   }
 }
